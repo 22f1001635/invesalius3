@@ -417,45 +417,95 @@ def bitmap2memmap(files, slice_size, orientation, spacing, resolution_percentage
 
 def dcm2memmap(files, slice_size, orientation, resolution_percentage):
     """
-    From a list of dicom files it creates memmap file in the temp folder and
-    returns it and its related filename.
+    Create memmap from DICOM files with enhanced validation and compatibility.
+    Returns: (matrix, scalar_range, temp_file)
     """
+    if len(files) <= 0:
+        raise ValueError("No DICOM files provided")
+        
+    # Show progress dialog if multiple files
     if len(files) > 1:
         message = _("Generating multiplanar visualization...")
         update_progress = vtk_utils.ShowProgress(len(files) - 1, dialog_type="ProgressDialog")
-
-    first_slice = read_dcm_slice_as_np2(files[0], resolution_percentage)
-    slice_size = first_slice.shape[::-1]
-
+    
+    # Try multiple approaches to get dimensions
+    try:
+        reader = gdcm.ImageReader()
+        reader.SetFileName(files[0])
+        if not reader.Read():
+            raise ValueError("Failed to read DICOM metadata with GDCM")
+            
+        image = reader.GetImage()
+        rows = image.GetDimension(1)
+        cols = image.GetDimension(0)
+        expected_shape = (rows, cols)
+    except Exception as gdcm_error:
+        try:
+            first_slice = read_dcm_slice_as_np2(files[0], resolution_percentage)
+            rows, cols = first_slice.shape
+            expected_shape = (rows, cols)
+        except Exception as slice_error:
+            raise ValueError(f"Failed to determine dimensions: GDCM error: {gdcm_error}, Slice error: {slice_error}")
+    
     temp_fd, temp_file = tempfile.mkstemp()
-
+    
+    # Determine matrix shape based on orientation
     if orientation == "SAGITTAL":
-        shape = slice_size[0], slice_size[1], len(files)
+        shape = cols, rows, len(files)
     elif orientation == "CORONAL":
-        shape = slice_size[1], len(files), slice_size[0]
-    else:
-        shape = len(files), slice_size[1], slice_size[0]
-
+        shape = rows, len(files), cols
+    else:  # AXIAL (default)
+        shape = len(files), rows, cols
+    
     matrix = np.memmap(temp_file, mode="w+", dtype="int16", shape=shape)
+    
+    min_val = np.iinfo(np.int16).max
+    max_val = np.iinfo(np.int16).min
+    
     for n, f in enumerate(files):
-        im_array = read_dcm_slice_as_np2(f, resolution_percentage)[::-1]
-
-        if orientation == "CORONAL":
-            matrix[:, shape[1] - n - 1, :] = im_array
-        elif orientation == "SAGITTAL":
-            # TODO: Verify if it's necessary to add the slices swapped only in
-            # sagittal rmi or only in # Rasiane's case or is necessary in all
-            # sagittal cases.
-            matrix[:, :, n] = im_array
-        else:
-            matrix[n] = im_array
-        if len(files) > 1:
-            update_progress(n, message)
-
+        try:
+            im_array = read_dcm_slice_as_np2(f, resolution_percentage)
+            
+            # Validate dimensions
+            if im_array.shape != expected_shape:
+                # Try to adapt the array if possible
+                if im_array.size == expected_shape[0] * expected_shape[1]:
+                    # Same number of elements, just reshape
+                    im_array = im_array.reshape(expected_shape)
+                else:
+                    raise ValueError(f"Slice {n} has incompatible dimensions: {im_array.shape} vs expected {expected_shape}")
+            
+            im_array = im_array[::-1]
+            
+            slice_min = im_array.min()
+            slice_max = im_array.max()
+            min_val = min(min_val, slice_min)
+            max_val = max(max_val, slice_max)
+            
+            # Assign to matrix based on orientation
+            if orientation == "CORONAL":
+                matrix[:, shape[1] - n - 1, :] = im_array
+            elif orientation == "SAGITTAL":
+                matrix[:, :, n] = im_array
+            else:  # AXIAL
+                matrix[n] = im_array
+                
+            if len(files) > 1:
+                update_progress(n, message)
+                
+        except Exception as e:
+            matrix.flush()
+            os.close(temp_fd)
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+            raise ValueError(f"Error processing slice {n} ({f}): {str(e)}")
+    
     matrix.flush()
-    scalar_range = matrix.min(), matrix.max()
+    scalar_range = (min_val, max_val)
     os.close(temp_fd)
-
+    
     return matrix, scalar_range, temp_file
 
 
